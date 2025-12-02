@@ -26,7 +26,7 @@ I(t+1) = I(t) + g_I * I(t)
 """
 
 from mesa import Agent, Model
-from mesa.time import SimultaneousActivation
+from mesa import SimultaneousActivation
 from mesa.space import NetworkGrid
 from mesa.datacollection import DataCollector
 import networkx as nx
