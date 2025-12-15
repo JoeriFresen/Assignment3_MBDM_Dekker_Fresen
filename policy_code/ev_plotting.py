@@ -174,3 +174,115 @@ def plot_phase_plot(phase_df: pd.DataFrame, out_path: Optional[str] = None) -> s
     plt.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close()
     return out_path
+
+
+# -----------------------------
+# Policy-focused plots
+# -----------------------------
+
+def _qband(mat: np.ndarray, qs=(0.10, 0.50, 0.90)):
+    q = np.quantile(mat, qs, axis=0)
+    return q[0], q[1], q[2]
+
+
+def plot_policy_overlay(
+    baseline_X,
+    baseline_I,
+    policy_X,
+    policy_I,
+    *,
+    start=None,
+    end=None,
+    title="Policy vs baseline",
+    out_path: Optional[str] = None,
+) -> str:
+    """Three-panel plot: X(t) overlay, ΔX(t), and I(t) overlay.
+
+    baseline_X/policy_X: list[np.ndarray] of shape (T,)
+    baseline_I/policy_I: list[np.ndarray] of shape (T,)
+
+    Shows median and 10–90% bands. Shades the policy window if provided.
+    """
+    if len(baseline_X) == 0 or len(policy_X) == 0:
+        raise ValueError("Need non-empty trajectories")
+
+    Xb = np.vstack(baseline_X)
+    Xp = np.vstack(policy_X)
+    Ib = np.vstack(baseline_I)
+    Ip = np.vstack(policy_I)
+
+    if Xb.shape != Xp.shape:
+        raise ValueError(f"Trajectory matrices must match. Got {Xb.shape} vs {Xp.shape}")
+
+    T = Xb.shape[1]
+    t = np.arange(T)
+
+    b_lo, b_med, b_hi = _qband(Xb)
+    p_lo, p_med, p_hi = _qband(Xp)
+
+    dX = Xp - Xb
+    d_lo, d_med, d_hi = _qband(dX)
+
+    i_b_lo, i_b_med, i_b_hi = _qband(Ib)
+    i_p_lo, i_p_med, i_p_hi = _qband(Ip)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), constrained_layout=True)
+
+    ax = axes[0]
+    ax.fill_between(t, b_lo, b_hi, alpha=0.15, label="Baseline 10–90%")
+    ax.plot(t, b_med, lw=2, label="Baseline median")
+    ax.fill_between(t, p_lo, p_hi, alpha=0.15, label="Policy 10–90%")
+    ax.plot(t, p_med, lw=2, label="Policy median")
+    ax.set_ylabel("Adoption X(t)")
+    ax.set_ylim(0, 1)
+
+    ax = axes[1]
+    ax.fill_between(t, d_lo, d_hi, alpha=0.15, label="ΔX 10–90%")
+    ax.plot(t, d_med, lw=2, label="ΔX median")
+    ax.axhline(0.0, lw=1)
+    ax.set_ylabel("Effect ΔX(t)")
+    ax.set_ylim(-1, 1)
+
+    ax = axes[2]
+    ax.fill_between(t, i_b_lo, i_b_hi, alpha=0.15, label="Baseline I 10–90%")
+    ax.plot(t, i_b_med, lw=2, label="Baseline I median")
+    ax.fill_between(t, i_p_lo, i_p_hi, alpha=0.15, label="Policy I 10–90%")
+    ax.plot(t, i_p_med, lw=2, label="Policy I median")
+    ax.set_ylabel("Infrastructure I(t)")
+    ax.set_xlabel("Time")
+    ax.set_ylim(0, 1)
+
+    if start is not None and end is not None:
+        for ax in axes:
+            ax.axvspan(start, end, alpha=0.10)
+
+    axes[0].legend(ncol=2, fontsize=9)
+    axes[1].legend(ncol=2, fontsize=9)
+    axes[2].legend(ncol=2, fontsize=9)
+
+    fig.suptitle(title, y=1.02)
+
+    if out_path is None:
+        out_path = _default_plot_path("policy_overlay.png")
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_success_over_time(trajs, *, threshold=0.5, out_path: Optional[str] = None, title=None) -> str:
+    """Plot P(X(t) >= threshold) over time from a list of trajectories."""
+    mat = np.vstack(trajs)
+    p = (mat >= float(threshold)).mean(axis=0)
+    t = np.arange(mat.shape[1])
+    fig, ax = plt.subplots(figsize=(7.2, 4.0))
+    ax.plot(t, p)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Time")
+    ax.set_ylabel(f"P(X(t) ≥ {threshold})")
+    ax.set_title(title or f"Success probability over time (threshold={threshold})")
+    ax.grid(True, alpha=0.25)
+    if out_path is None:
+        out_path = _default_plot_path("success_over_time.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path

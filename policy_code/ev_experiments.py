@@ -73,6 +73,35 @@ def policy_infrastructure_boost_factory(start: int, boost: float = 0.2, once: bo
     return policy
 
 
+
+def policy_targeted_seeding_factory(start: int, frac: float = 0.05, once: bool = True, high: bool = True) -> Callable:
+    """Convert a fraction of agents to EV adopters at a given time.
+
+    Targets nodes by degree (high-degree by default). This is a classic
+    "targeted seeding" intervention: nudges a cascade by flipping influential nodes.
+    """
+
+    def policy(model, step):
+        if step < start:
+            return
+        if once and getattr(policy, "done", False):
+            return
+
+        deg = dict(model.G.degree())
+        ordered_nodes = sorted(deg.keys(), key=lambda u: deg[u], reverse=high)
+        k = max(1, int(round(frac * model.G.number_of_nodes())))
+        chosen = set(ordered_nodes[:k])
+
+        # Flip any agent occupying chosen nodes
+        for a in model.schedule.agents:
+            if getattr(a, 'pos', None) in chosen:
+                a.strategy = 'C'
+                a.next_strategy = 'C'
+
+        policy.done = True
+
+    return policy
+
 # -----------------------------
 # Trial runner
 # -----------------------------
@@ -162,6 +191,8 @@ def _timeseries_trial_worker(args_dict: Dict) -> Tuple[np.ndarray, np.ndarray]:
             policy = policy_subsidy_factory(**policy_spec["params"])
         elif ptype == "infrastructure":
             policy = policy_infrastructure_boost_factory(**policy_spec["params"])
+        elif ptype == "targeted_seeding":
+            policy = policy_targeted_seeding_factory(**policy_spec["params"])
 
     X, I, _df = run_timeseries_trial(
         T=T,
@@ -187,14 +218,27 @@ def collect_intervention_trials(
     seed_base: int = 42,
     strategy_choice_func: str = "imitate",
     tau: float = 1.0,
+    *,
+    policy_spec: Optional[Dict] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray], pd.DataFrame, pd.DataFrame]:
-    """Run baseline and subsidy trials; return raw trajectories and summary dataframes."""
+    """Run baseline and policy trials; return raw trajectories and summary dataframes.
+
+    Important: trials are *paired by seed/index* so baseline[i] corresponds to policy[i].
+    This avoids scrambled comparisons when using as_completed().
+
+    `policy_spec` overrides `subsidy_params` if provided.
+    Example:
+      policy_spec={"type":"targeted_seeding","params":{"start":20,"frac":0.05}}
+    """
 
     scenario = scenario_kwargs or {}
-    subsidy = subsidy_params or {"start": 30, "end": 80, "delta_a0": 0.3, "delta_beta_I": 0.0}
+
+    if policy_spec is None:
+        subsidy = subsidy_params or {"start": 30, "end": 80, "delta_a0": 0.3, "delta_beta_I": 0.0}
+        policy_spec = {"type": "subsidy", "params": subsidy}
 
     baseline_args = []
-    subsidy_args = []
+    policy_args = []
     for i in range(n_trials):
         seed = seed_base + i
         baseline_args.append(
@@ -207,37 +251,36 @@ def collect_intervention_trials(
                 "tau": tau,
             }
         )
-        subsidy_args.append(
+        policy_args.append(
             {
                 "T": T,
                 "scenario_kwargs": scenario,
                 "seed": seed,
-                "policy": {"type": "subsidy", "params": subsidy},
+                "policy": policy_spec,
                 "strategy_choice_func": strategy_choice_func,
                 "tau": tau,
             }
         )
 
-    baseline_X, baseline_I = [], []
-    subsidy_X, subsidy_I = [], []
+    baseline_X, baseline_I = [None] * n_trials, [None] * n_trials
+    policy_X, policy_I = [None] * n_trials, [None] * n_trials
 
-    # Run sequentially or concurrently
     Executor = ThreadPoolExecutor if max_workers == 1 else ProcessPoolExecutor
     with Executor(max_workers=max_workers) as ex:
-        baseline_futs = [ex.submit(_timeseries_trial_worker, args) for args in baseline_args]
-        subsidy_futs = [ex.submit(_timeseries_trial_worker, args) for args in subsidy_args]
-        for fut in as_completed(baseline_futs):
-            X, I = fut.result()
-            baseline_X.append(X)
-            baseline_I.append(I)
-        for fut in as_completed(subsidy_futs):
-            X, I = fut.result()
-            subsidy_X.append(X)
-            subsidy_I.append(I)
+        b_futs = {ex.submit(_timeseries_trial_worker, args): i for i, args in enumerate(baseline_args)}
+        p_futs = {ex.submit(_timeseries_trial_worker, args): i for i, args in enumerate(policy_args)}
 
-    # Align order by seed (as_completed may scramble)
-    baseline_X = sorted(baseline_X, key=lambda arr: tuple(arr))
-    subsidy_X = sorted(subsidy_X, key=lambda arr: tuple(arr))
+        for fut in as_completed(list(b_futs.keys()) + list(p_futs.keys())):
+            if fut in b_futs:
+                i = b_futs[fut]
+                X, I = fut.result()
+                baseline_X[i] = X
+                baseline_I[i] = I
+            else:
+                i = p_futs[fut]
+                X, I = fut.result()
+                policy_X[i] = X
+                policy_I[i] = I
 
     # Summary stats
     def summarize(X_list: List[np.ndarray]) -> pd.DataFrame:
@@ -253,20 +296,23 @@ def collect_intervention_trials(
         return df
 
     baseline_df = summarize(baseline_X)
-    subsidy_df = summarize(subsidy_X)
+    policy_df = summarize(policy_X)
 
-    return baseline_X, baseline_I, subsidy_X, subsidy_I, baseline_df, subsidy_df
+    return baseline_X, baseline_I, policy_X, policy_I, baseline_df, policy_df
 
 
-def traces_to_long_df(baseline_X: List[np.ndarray], subsidy_X: List[np.ndarray]) -> pd.DataFrame:
-    """Convert trajectory lists to a tidy DataFrame: [group, trial, time, X]."""
+def traces_to_long_df(baseline_X: List[np.ndarray], policy_X: List[np.ndarray], *, policy_label: str = 'policy') -> pd.DataFrame:
+    """Convert trajectory lists to a tidy DataFrame: [group, trial, time, X].
+
+    baseline and policy are assumed aligned by trial index.
+    """
     rows = []
     for trial, X in enumerate(baseline_X):
         for t, x in enumerate(X):
             rows.append(("baseline", trial, t, float(x)))
-    for trial, X in enumerate(subsidy_X):
+    for trial, X in enumerate(policy_X):
         for t, x in enumerate(X):
-            rows.append(("subsidy", trial, t, float(x)))
+            rows.append((policy_label, trial, t, float(x)))
     return pd.DataFrame(rows, columns=["group", "trial", "time", "X"])
 
 

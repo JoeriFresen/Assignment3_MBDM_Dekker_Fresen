@@ -26,7 +26,7 @@ I(t+1) = I(t) + g_I * I(t)
 """
 
 from mesa import Agent, Model
-from mesa import SimultaneousActivation
+from mesa.time import SimultaneousActivation
 from mesa.space import NetworkGrid
 from mesa.datacollection import DataCollector
 import networkx as nx
@@ -212,16 +212,40 @@ class EVStagHuntModel(Model):
         collect=True,
         strategy_choice_func: str = "imitate",
         tau: float = 1.0,
+        # Extended network options (backwards compatible)
+        G=None,
+        grid_k: int = 6,
+        rewire_p: float = 0.05,
     ):
         super().__init__(seed=seed)
 
         # Build graph
-        if network_type == "BA":
-            G = nx.barabasi_albert_graph(n_nodes, m, seed=seed)
+        if G is not None:
+            self.G = G
         else:
-            G = nx.erdos_renyi_graph(n_nodes, p, seed=seed)
-        self.G = G
-        self.grid = NetworkGrid(G)
+            nt = str(network_type).lower()
+            if nt in ["ba", "scale_free"]:
+                self.G = nx.barabasi_albert_graph(n_nodes, m, seed=seed)
+            elif nt in ["grid", "lattice"]:
+                # 2D grid with ~sqrt(N) x ~sqrt(N), then truncate to n_nodes
+                import math
+                L = int(round(math.sqrt(n_nodes)))
+                W = int(math.ceil(n_nodes / L))
+                Gg = nx.grid_2d_graph(L, W, periodic=False)
+                mapping = {node: i for i, node in enumerate(Gg.nodes())}
+                Gg = nx.relabel_nodes(Gg, mapping)
+                if Gg.number_of_nodes() > n_nodes:
+                    Gg.remove_nodes_from(list(range(n_nodes, Gg.number_of_nodes())))
+                self.G = Gg
+            elif nt in ["small_world", "ws", "watts_strogatz"]:
+                k = int(grid_k)
+                if k % 2 == 1:
+                    k += 1
+                self.G = nx.watts_strogatz_graph(n_nodes, k, float(rewire_p), seed=seed)
+            else:
+                self.G = nx.erdos_renyi_graph(n_nodes, p, seed=seed)
+
+        self.grid = NetworkGrid(self.G)
         self.schedule = SimultaneousActivation(self)
 
         # parameters
@@ -322,7 +346,8 @@ def set_initial_adopters(model, X0_frac, method="random", seed=None, high=True):
         ordered_nodes = sorted(deg.keys(), key=lambda u: deg[u], reverse=high)
         chosen = set(ordered_nodes[:k])
         for a in agents:
-            if a.unique_id in chosen:
+            # Mesa NetworkGrid stores node id in a.pos
+            if getattr(a, 'pos', None) in chosen:
                 a.strategy = "C"
         return
 
